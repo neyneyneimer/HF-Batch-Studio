@@ -1,7 +1,9 @@
 /**
- * On-Device Hardware-backed Credential Encryption.
- * Mirrors Android Keystore AES-256-GCM encryption with PBKDF2 key derivation.
- * Ensures zero plaintext token storage, no token logging, and no external transmission.
+ * Browser-side Web Crypto AES-GCM Credential Encryption.
+ * Uses Web Crypto API (AES-256-GCM + PBKDF2).
+ * Note: Browser environment is software-backed (master key seed stored in client storage).
+ * Hardware-backed security (Android Keystore / TEE) is implemented in the native Android application.
+ * Ensures tokens are never exported, logged, or transmitted to third parties.
  */
 
 const KEY_DERIVATION_ITERATIONS = 100_000;

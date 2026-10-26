@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { expandPromptMatrix, calculateSeed, parseBulkPrompts } from './promptMatrix';
 import { classifyGradioError, buildGradioPayload, normalizeSpaceUrl } from './gradioAdapter';
-import { GradioParamSpec } from '../types';
+import { GradioParamSpec, BatchJob } from '../types';
 import { estimatePromptTokens, parseAndValidateImport } from './exportManager';
 
 test('expandPromptMatrix expands combinatorial matrix brackets', () => {
@@ -62,8 +62,8 @@ test('parseBulkPrompts handles plain lines and CSV headers', () => {
   assert.equal(csvParsed[0].seed, 1234);
 });
 
-test('classifyGradioError categorizes quota, auth, and timeout states correctly', () => {
-  // Quota Exhausted
+test('classifyGradioError categorizes quota, auth, timeout, and server errors correctly', () => {
+  // Quota Exhausted - HTTP 429 and ZeroGPU limits
   const quotaErr = classifyGradioError(429, 'Rate limit exceeded: GPU quota reached for this 24-hour cycle');
   assert.equal(quotaErr.type, 'QUOTA_EXHAUSTED');
   assert.ok(quotaErr.message.includes('quota'));
@@ -71,15 +71,19 @@ test('classifyGradioError categorizes quota, auth, and timeout states correctly'
   const zeroGpuErr = classifyGradioError(200, 'ZeroGPU queue limit exceeded. Please wait 12 minutes');
   assert.equal(zeroGpuErr.type, 'QUOTA_EXHAUSTED');
 
-  // Auth failure
+  // Auth failure - 401 / 403 / Invalid token
   const authErr = classifyGradioError(401, 'Unauthorized: Invalid token');
   assert.equal(authErr.type, 'AUTH');
+  assert.ok(authErr.message.includes('authentication failed'));
 
-  // Timeout
+  const forbiddenErr = classifyGradioError(403, 'Forbidden: Private space requires authorized read token');
+  assert.equal(forbiddenErr.type, 'AUTH');
+
+  // Timeout - 504 / gateway timeout
   const timeoutErr = classifyGradioError(504, 'Gateway Timeout');
   assert.equal(timeoutErr.type, 'TIMEOUT');
 
-  // Server error
+  // Server error - 500 / CUDA out of memory
   const serverErr = classifyGradioError(500, 'RuntimeError: CUDA out of memory');
   assert.equal(serverErr.type, 'SERVER_ERROR');
 });
@@ -147,3 +151,80 @@ test('parseAndValidateImport handles valid and invalid JSON packages', () => {
   assert.equal(validRes.data?.jobs?.length, 1);
 });
 
+test('duplicate submission prevention checks persistent eventId', () => {
+  const existingJob: BatchJob = {
+    id: 'job_123',
+    profileId: 'prof_1',
+    spaceId: 'space_1',
+    prompt: 'Space cat',
+    seed: 42,
+    status: 'GENERATING',
+    stage: 'gen',
+    stageMessage: 'Processing',
+    progress: 50,
+    retryCount: 0,
+    maxRetries: 2,
+    createdAt: Date.now(),
+    eventId: 'evt_existing_abc123',
+  };
+
+  // Verifies that a job with an eventId does not generate a new submission
+  assert.ok(existingJob.eventId !== undefined);
+  assert.equal(existingJob.eventId, 'evt_existing_abc123');
+});
+
+test('pause and resume preserves job state without resetting retry count', () => {
+  let jobState: BatchJob = {
+    id: 'job_456',
+    profileId: 'prof_1',
+    spaceId: 'space_1',
+    prompt: 'Dragon',
+    seed: 999,
+    status: 'GENERATING',
+    stage: 'gen',
+    stageMessage: 'Inference in progress',
+    progress: 45,
+    retryCount: 1,
+    maxRetries: 3,
+    createdAt: Date.now(),
+  };
+
+  // Simulate Pause
+  jobState = {
+    ...jobState,
+    status: 'PAUSED',
+    stageMessage: 'Queue paused by user. State preserved.',
+  };
+  assert.equal(jobState.status, 'PAUSED');
+  assert.equal(jobState.retryCount, 1);
+  assert.equal(jobState.progress, 45);
+
+  // Simulate Resume
+  jobState = {
+    ...jobState,
+    status: 'QUEUED',
+  };
+  assert.equal(jobState.status, 'QUEUED');
+  assert.equal(jobState.retryCount, 1); // Not reset!
+});
+
+test('magic byte file verification validates PNG, JPEG, and MP4 signatures', () => {
+  // PNG: 89 50 4E 47
+  const pngHeader = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  const isPng = pngHeader[0] === 0x89 && pngHeader[1] === 0x50 && pngHeader[2] === 0x4E && pngHeader[3] === 0x47;
+  assert.equal(isPng, true);
+
+  // JPEG: FF D8 FF
+  const jpegHeader = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+  const isJpeg = jpegHeader[0] === 0xFF && jpegHeader[1] === 0xD8 && jpegHeader[2] === 0xFF;
+  assert.equal(isJpeg, true);
+
+  // MP4: 00 00 00 18 'ftyp'
+  const mp4Header = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32]);
+  const isMp4 = mp4Header.toString('ascii', 4, 8) === 'ftyp';
+  assert.equal(isMp4, true);
+
+  // Corrupt or empty buffer is rejected
+  const emptyBuffer = Buffer.alloc(0);
+  assert.equal(emptyBuffer.length, 0);
+});

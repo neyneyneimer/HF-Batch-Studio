@@ -352,9 +352,58 @@ export const SpacesView: React.FC<SpacesViewProps> = ({
             </div>
 
             {discoveryError && (
-              <div className="p-3 bg-red-950/30 border border-red-800/50 rounded-lg text-xs text-red-400 flex items-start gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{discoveryError}</span>
+              <div className="p-3 bg-red-950/30 border border-red-800/50 rounded-lg text-xs text-red-400 space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{discoveryError}</span>
+                </div>
+                <div className="pt-1 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const cleanInput = spaceUrlInput.trim();
+                      const repoName = cleanInput.replace(/https?:\/\/huggingface\.co\/spaces\//, '').replace(/\/+$/, '') || 'Custom Space';
+                      const manualSpace: Space = {
+                        id: `space_manual_${Date.now()}`,
+                        name: repoName,
+                        url: cleanInput.startsWith('http') ? cleanInput : `https://huggingface.co/spaces/${cleanInput}`,
+                        directApiUrl: cleanInput.includes('.hf.space') ? cleanInput : `https://${repoName.replace(/[\/_]/g, '-').toLowerCase()}.hf.space`,
+                        type: 'image',
+                        status: 'MANUAL',
+                        apiProtocol: 'v4_stream',
+                        description: 'Custom manual endpoint mapping',
+                        lastDiscoveredAt: Date.now(),
+                        isBuiltin: false,
+                        selectedEndpoint: '/predict',
+                        endpoints: [
+                          {
+                            path: '/predict',
+                            isQueue: true,
+                            outputType: 'image',
+                            parameters: [
+                              { name: 'prompt', type: 'string', default: '', inputIndex: 0, description: 'Prompt' },
+                              { name: 'seed', type: 'number', default: 42, inputIndex: 1, description: 'Seed' },
+                            ],
+                          },
+                        ],
+                      };
+                      const updated = [manualSpace, ...spaces];
+                      LocalRoomDatabase.saveSpaces(updated);
+                      onSpacesChange(updated);
+                      setSelectedSpace(manualSpace);
+                      setIsDiscoverModalOpen(false);
+                      setManualEndpointPath('/predict');
+                      setManualParams(manualSpace.endpoints[0].parameters);
+                      setIsManualEditOpen(true);
+                      setDiscoveryError(null);
+                      setSpaceUrlInput('');
+                    }}
+                    className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-amber-400 rounded-md font-medium text-xs flex items-center gap-1.5 transition-colors"
+                  >
+                    <Sliders className="w-3.5 h-3.5" />
+                    <span>Configure Manual Endpoint Mapping</span>
+                  </button>
+                </div>
               </div>
             )}
 

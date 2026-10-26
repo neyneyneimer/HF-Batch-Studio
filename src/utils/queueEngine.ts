@@ -1,4 +1,4 @@
-import { BatchJob, BatchResult, Space, JobProfile, HFAccount, AppSettings } from '../types';
+import { BatchJob, BatchResult, Space, HFAccount } from '../types';
 import { LocalRoomDatabase } from './storage';
 import { buildGradioPayload, classifyGradioError } from './gradioAdapter';
 import { preflightMedia } from './preflight';
@@ -52,7 +52,7 @@ export class BatchQueueEngine {
     this.isRunning = false;
     this.updateJobState(this.currentActiveJobId, {
       status: 'PAUSED',
-      stageMessage: 'Queue paused by user. Computation can be resumed.',
+      stageMessage: 'Queue paused. Job state and progress preserved; ready to resume.',
     });
     this.notify();
   }
@@ -67,7 +67,7 @@ export class BatchQueueEngine {
     this.isPaused = false;
     this.isRunning = true;
     this.runQueueLoop().catch(err => {
-      console.error('Queue loop encountered an error:', err);
+      console.error('Queue loop error:', err);
       this.isRunning = false;
       this.notify();
     });
@@ -98,7 +98,6 @@ export class BatchQueueEngine {
     if (index === -1) return;
 
     if (direction === 'up' && index > 0) {
-      // Don't reorder past an active running job
       if (jobs[index - 1].status === 'GENERATING' || jobs[index - 1].status === 'PREPARING') return;
       const temp = jobs[index];
       jobs[index] = jobs[index - 1];
@@ -175,7 +174,7 @@ export class BatchQueueEngine {
   private async runQueueLoop() {
     while (this.isRunning && !this.isPaused) {
       const jobs = LocalRoomDatabase.getJobs();
-      const nextJob = jobs.find(j => j.status === 'QUEUED');
+      const nextJob = jobs.find(j => j.status === 'QUEUED' || j.status === 'PAUSED');
 
       if (!nextJob) {
         this.isRunning = false;
@@ -200,7 +199,7 @@ export class BatchQueueEngine {
       }
 
       // Small tick between batch items
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 250));
     }
   }
 
@@ -241,7 +240,7 @@ export class BatchQueueEngine {
           saltHex: account.saltHex,
         });
       } catch (err) {
-        console.warn('Failed to decrypt HF token in Keystore:', err);
+        console.warn('Failed to decrypt HF token:', err);
       }
     }
 
@@ -251,13 +250,16 @@ export class BatchQueueEngine {
     this.updateJobState(job.id, {
       status: 'PREPARING',
       stage: 'prep',
-      stageMessage: 'Worker 1: Validating parameters and preflighting media...',
+      stageMessage: 'Worker 1: Validating parameters, checking inputs, and preparing payload...',
       progress: 5,
-      startedAt: Date.now(),
+      startedAt: job.startedAt || Date.now(),
     });
 
     if (signal.aborted) return;
 
+    let processedInputMedia = job.inputMediaData;
+
+    // Local media preflight
     if (job.inputMediaData && profile?.preflightEnabled !== false) {
       const preflight = await preflightMedia(job.inputMediaData);
       if (!preflight.valid) {
@@ -268,6 +270,29 @@ export class BatchQueueEngine {
           errorDetails: preflight.errors.join('; '),
         });
         return;
+      }
+
+      // If input media is base64 data URL, upload to Gradio Space /upload endpoint
+      if (job.inputMediaData.startsWith('data:')) {
+        this.updateJobState(job.id, {
+          stageMessage: 'Worker 1: Uploading input media to Gradio Space...',
+          progress: 10,
+        });
+
+        try {
+          const uploadRes = await this.uploadInputMedia(space.directApiUrl, job.inputMediaData, authToken, signal);
+          if (uploadRes && uploadRes.length > 0) {
+            processedInputMedia = uploadRes[0];
+          }
+        } catch (uploadErr: any) {
+          this.updateJobState(job.id, {
+            status: 'FAILED_PREPARATION',
+            stage: 'prep',
+            stageMessage: 'Failed to upload input media to Gradio server',
+            errorDetails: uploadErr.message,
+          });
+          return;
+        }
       }
     }
 
@@ -283,28 +308,30 @@ export class BatchQueueEngine {
       numFrames: profile?.numFrames,
       fps: profile?.fps,
       motionBucket: profile?.motionBucket,
-      inputMediaData: job.inputMediaData,
+      inputMediaData: processedInputMedia,
       customParams: job.params,
     });
 
     if (signal.aborted) return;
 
     // ==========================================
-    // STAGE 2: GenerationWorker
+    // STAGE 2: GenerationWorker (Real Gradio API)
     // ==========================================
+    const sessionHash = job.sessionHash || Math.random().toString(36).substring(2, 13);
     this.updateJobState(job.id, {
       status: 'GENERATING',
       stage: 'gen',
-      stageMessage: 'Worker 2: Submitting to Gradio queue...',
+      stageMessage: 'Worker 2: Connecting to Gradio queue...',
       progress: 15,
-      sessionHash: Math.random().toString(36).substring(2, 13),
+      sessionHash,
     });
 
     let rawMediaResult: { url: string; mimeType: string } | null = null;
     const startTime = Date.now();
 
     try {
-      rawMediaResult = await this.executeGradioGeneration(
+      rawMediaResult = await this.executeRealGradioGeneration(
+        job,
         space,
         payload,
         authToken,
@@ -338,7 +365,7 @@ export class BatchQueueEngine {
           stage: 'gen',
           stageMessage: 'Free GPU compute quota exhausted on Hugging Face.',
           errorDetails:
-            'Per-account free tier GPU quota has been reached. Pending jobs have been safely preserved in queue. To resume, wait for quota reset or switch to another authorized account with quota.',
+            'Per-account free tier GPU quota reached. Pending jobs have been safely preserved in queue. To resume, wait for quota reset or select another authorized account with valid quota.',
         });
         this.isPaused = true;
         this.isRunning = false;
@@ -361,14 +388,17 @@ export class BatchQueueEngine {
         });
         return;
       } else {
-        // Retry logic if configured
+        // Safe retry semantics with exponential backoff
         if (settings.autoRetryFailures && job.retryCount < job.maxRetries) {
+          const nextRetry = job.retryCount + 1;
+          const backoffDelay = Math.min(1000 * Math.pow(2, nextRetry), 15000);
           this.updateJobState(job.id, {
             status: 'QUEUED',
             stage: 'idle',
-            retryCount: job.retryCount + 1,
-            stageMessage: `Retrying (attempt ${job.retryCount + 1}/${job.maxRetries})...`,
+            retryCount: nextRetry,
+            stageMessage: `Retrying (attempt ${nextRetry}/${job.maxRetries}) after ${backoffDelay / 1000}s backoff...`,
           });
+          await new Promise(r => setTimeout(r, backoffDelay));
           return;
         }
 
@@ -385,18 +415,59 @@ export class BatchQueueEngine {
     if (signal.aborted || !rawMediaResult) return;
 
     // ==========================================
-    // STAGE 3: DownloadWorker
+    // STAGE 3: DownloadWorker (Real Verified Storage)
     // ==========================================
     this.updateJobState(job.id, {
       status: 'DOWNLOADING',
       stage: 'dl',
-      stageMessage: 'Worker 3: Fetching result blob and verifying integrity...',
+      stageMessage: 'Worker 3: Verifying media signatures and saving to disk storage...',
       progress: 90,
     });
 
     const durationMs = Date.now() - startTime;
-    const resultId = `res_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let savedMedia: { url: string; sizeBytes: number; mimeType: string };
 
+    try {
+      const saveRes = await fetch('/api/media/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remoteUrl: rawMediaResult.url,
+          prompt: job.prompt,
+          seed: job.seed,
+          spaceId: space.id,
+          type: space.type,
+          authToken,
+        }),
+        signal,
+      });
+
+      if (!saveRes.ok) {
+        const errText = await saveRes.text();
+        throw new Error(`Media save failed: ${errText}`);
+      }
+
+      const saveJson = await saveRes.json();
+      if (!saveJson.success || !saveJson.verified) {
+        throw new Error(saveJson.error || 'Media integrity check failed');
+      }
+
+      savedMedia = {
+        url: saveJson.url,
+        sizeBytes: saveJson.sizeBytes,
+        mimeType: saveJson.mimeType,
+      };
+    } catch (saveErr: any) {
+      this.updateJobState(job.id, {
+        status: 'FAILED_SERVER_ERROR',
+        stage: 'dl',
+        stageMessage: 'Media verification failed',
+        errorDetails: `Server output verification failed: ${saveErr.message}. Result not accepted.`,
+      });
+      return;
+    }
+
+    const resultId = `res_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const newResult: BatchResult = {
       id: resultId,
       jobId: job.id,
@@ -404,8 +475,8 @@ export class BatchQueueEngine {
       spaceId: space.id,
       spaceName: space.name,
       type: space.type,
-      mediaUrl: rawMediaResult.url,
-      thumbnailUrl: rawMediaResult.url,
+      mediaUrl: savedMedia.url,
+      thumbnailUrl: savedMedia.url,
       prompt: job.prompt,
       seed: job.seed,
       parameters: {
@@ -415,19 +486,21 @@ export class BatchQueueEngine {
         guidance: profile?.guidanceScale || 7.5,
         ...job.params,
       },
-      sizeBytes: 1024 * 512, // approx 512 KB
+      sizeBytes: savedMedia.sizeBytes,
       durationMs,
       verified: true,
-      mimeType: rawMediaResult.mimeType,
+      mimeType: savedMedia.mimeType,
       createdAt: Date.now(),
     };
 
     const existingResults = LocalRoomDatabase.getResults();
     LocalRoomDatabase.saveResults([newResult, ...existingResults]);
 
-    // Optional Auto-Download
     if (settings.autoDownload) {
-      this.triggerDirectDownload(rawMediaResult.url, `hf_batch_${job.seed}_${Date.now()}.${space.type === 'video' ? 'mp4' : 'png'}`);
+      this.triggerDirectDownload(
+        savedMedia.url,
+        `hf_batch_${job.seed}_${Date.now()}.${space.type === 'video' ? 'mp4' : 'png'}`
+      );
     }
 
     this.updateJobState(job.id, {
@@ -441,55 +514,270 @@ export class BatchQueueEngine {
   }
 
   /**
-   * Dispatches generation to Gradio Space.
-   * If live Gradio endpoint is accessible via CORS, streams queue updates.
-   * Otherwise uses high-fidelity procedural SVG/Canvas/Video generator matching prompt & seed
-   * ensuring verified end-to-end user journeys without sandbox timeouts.
+   * Uploads input media to Gradio Space /upload proxy
    */
-  private async executeGradioGeneration(
+  private async uploadInputMedia(
+    directHost: string,
+    dataUrl: string,
+    authToken?: string,
+    signal?: AbortSignal
+  ): Promise<any[]> {
+    const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+    if (!match) throw new Error('Invalid data URI for upload');
+
+    const mime = match[1];
+    const byteChars = atob(match[2]);
+    const byteNums = new Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) {
+      byteNums[i] = byteChars.charCodeAt(i);
+    }
+    const byteArray = new Uint8Array(byteNums);
+    const blob = new Blob([byteArray], { type: mime });
+
+    const formData = new FormData();
+    formData.append('file', blob, `input_${Date.now()}.${mime.includes('video') ? 'mp4' : 'png'}`);
+    formData.append('directHost', directHost);
+    if (authToken) formData.append('authToken', authToken);
+
+    const res = await fetch('/api/gradio/upload', {
+      method: 'POST',
+      body: formData,
+      signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Upload failed (${res.status}): ${errText}`);
+    }
+
+    const data = await res.json();
+    return data.files || [];
+  }
+
+  /**
+   * REAL Gradio API Execution:
+   * Submits job to Gradio endpoint via /api/gradio/call,
+   * streams real progress/events via /api/gradio/stream,
+   * and parses real output media URLs.
+   * NEVER generates mock results or procedural drawings.
+   */
+  private async executeRealGradioGeneration(
+    job: BatchJob,
     space: Space,
     payload: any[],
     authToken: string | undefined,
     onProgress: (progress: number, message: string, eta?: number, queuePos?: number) => void,
     signal: AbortSignal
   ): Promise<{ url: string; mimeType: string }> {
-    // Stage updates: simulate realistic worker checkpoints
-    onProgress(25, 'Connecting to Gradio server...', 8, 1);
-    await new Promise((r, reject) => {
-      const t = setTimeout(r, 600);
-      signal.addEventListener('abort', () => {
-        clearTimeout(t);
-        reject(new DOMException('Aborted', 'AbortError'));
+    onProgress(15, 'Submitting job to Gradio endpoint...');
+
+    // 1. Submit job via call proxy (Duplicate prevention: verify if eventId exists)
+    let eventId = job.eventId;
+    let streamUrl: string | undefined;
+    let directData: any = null;
+
+    if (!eventId) {
+      const callRes = await fetch('/api/gradio/call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          directHost: space.directApiUrl,
+          endpoint: space.selectedEndpoint || (space.endpoints[0]?.path ?? '/predict'),
+          payload,
+          authToken,
+        }),
+        signal,
       });
-    });
 
-    onProgress(50, 'Gradio worker processing model forward pass...', 5, 0);
-    await new Promise((r, reject) => {
-      const t = setTimeout(r, 1200);
-      signal.addEventListener('abort', () => {
-        clearTimeout(t);
-        reject(new DOMException('Aborted', 'AbortError'));
-      });
-    });
+      if (!callRes.ok) {
+        const errorText = await callRes.text();
+        const err: any = new Error(errorText || `HTTP ${callRes.status}`);
+        err.statusCode = callRes.status;
+        throw err;
+      }
 
-    onProgress(80, 'Decoding latent representations to output frames...', 2);
-    await new Promise((r, reject) => {
-      const t = setTimeout(r, 600);
-      signal.addEventListener('abort', () => {
-        clearTimeout(t);
-        reject(new DOMException('Aborted', 'AbortError'));
-      });
-    });
+      const callData = await callRes.json();
+      if (!callData.success) {
+        const err: any = new Error(callData.error || 'Call submission rejected');
+        err.statusCode = callData.status || 500;
+        throw err;
+      }
 
-    // Generate verified deterministic high-fidelity media blob
-    const isVideo = space.type === 'video';
-    const seed = typeof payload[1] === 'number' ? payload[1] : 42;
-    const prompt = typeof payload[0] === 'string' ? payload[0] : 'Artwork';
+      eventId = callData.eventId;
+      streamUrl = callData.streamUrl;
+      directData = callData.directData;
 
-    const dataUrl = renderProceduralMedia(prompt, seed, isVideo);
+      // Immediately persist eventId to avoid duplicate submission on restart
+      if (eventId) {
+        this.updateJobState(job.id, { eventId });
+      }
+    } else {
+      // Re-attaching to existing eventId
+      const cleanEndpoint = (space.selectedEndpoint || space.endpoints[0]?.path || '/predict').replace(/^\//, '');
+      streamUrl = `${space.directApiUrl}/gradio_api/call/${cleanEndpoint}/${eventId}`;
+    }
+
+    // 2. If direct data was returned (v3 json)
+    if (directData) {
+      onProgress(85, 'Direct response received. Processing output...');
+      return this.extractMediaFromGradioOutput(directData, space);
+    }
+
+    // 3. If streamUrl returned (v4 SSE stream), listen for events
+    if (streamUrl) {
+      return await this.listenToGradioSSE(streamUrl, authToken, space, onProgress, signal);
+    }
+
+    throw new Error('Gradio Space did not return a valid event identifier or output stream.');
+  }
+
+  /**
+   * Connects to Gradio SSE stream through /api/gradio/stream proxy,
+   * parsing progress, log, and complete events.
+   */
+  private async listenToGradioSSE(
+    streamUrl: string,
+    authToken: string | undefined,
+    space: Space,
+    onProgress: (progress: number, message: string, eta?: number, queuePos?: number) => void,
+    signal: AbortSignal
+  ): Promise<{ url: string; mimeType: string }> {
+    const proxyUrl = `/api/gradio/stream?streamUrl=${encodeURIComponent(streamUrl)}${
+      authToken ? '&authToken=' + encodeURIComponent(authToken) : ''
+    }`;
+
+    const response = await fetch(proxyUrl, { signal });
+    if (!response.ok) {
+      const errText = await response.text();
+      const err: any = new Error(`SSE stream error: ${errText}`);
+      err.statusCode = response.status;
+      throw err;
+    }
+
+    if (!response.body) {
+      throw new Error('No SSE stream body received');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let completedData: any = null;
+
+    while (true) {
+      if (signal.aborted) {
+        reader.cancel();
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let currentEvent = '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('event:')) {
+          currentEvent = trimmed.replace('event:', '').trim();
+        } else if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.replace('data:', '').trim();
+          if (!dataStr) continue;
+
+          try {
+            const dataJson = JSON.parse(dataStr);
+
+            if (currentEvent === 'progress') {
+              // Gradio progress event: [ { progress, desc, eta, unit } ] or { progress, desc, eta }
+              const pItem = Array.isArray(dataJson) ? dataJson[0] : dataJson;
+              const pVal = typeof pItem.progress === 'number' ? Math.round(pItem.progress * 100) : 40;
+              const desc = pItem.desc || 'Processing model inference...';
+              const eta = typeof pItem.eta === 'number' ? Math.round(pItem.eta) : undefined;
+              onProgress(Math.min(90, Math.max(20, pVal)), desc, eta);
+            } else if (currentEvent === 'log') {
+              onProgress(50, typeof dataJson === 'string' ? dataJson : 'Computing...');
+            } else if (currentEvent === 'error') {
+              const err: any = new Error(typeof dataJson === 'string' ? dataJson : 'Gradio pipeline error');
+              err.statusCode = 500;
+              throw err;
+            } else if (currentEvent === 'complete') {
+              completedData = dataJson;
+            }
+          } catch (e: any) {
+            if (currentEvent === 'error') throw e;
+          }
+        }
+      }
+
+      if (completedData) break;
+    }
+
+    if (!completedData) {
+      throw new Error('Gradio SSE stream ended without emitting a completion payload.');
+    }
+
+    return this.extractMediaFromGradioOutput(completedData, space);
+  }
+
+  /**
+   * Inspects Gradio completion data structures to extract the generated media file URL
+   */
+  private extractMediaFromGradioOutput(
+    outputData: any,
+    space: Space
+  ): { url: string; mimeType: string } {
+    let items: any[] = [];
+    if (Array.isArray(outputData)) {
+      items = outputData;
+    } else if (outputData && typeof outputData === 'object') {
+      if (Array.isArray(outputData.data)) items = outputData.data;
+      else items = [outputData];
+    } else {
+      items = [outputData];
+    }
+
+    let foundUrl: string | null = null;
+    let mimeType = space.type === 'video' ? 'video/mp4' : 'image/png';
+
+    for (const item of items) {
+      if (!item) continue;
+
+      if (typeof item === 'string') {
+        if (item.startsWith('http://') || item.startsWith('https://') || item.startsWith('data:')) {
+          foundUrl = item;
+          break;
+        } else if (item.startsWith('/file=') || item.startsWith('file=')) {
+          const cleanPath = item.startsWith('/') ? item : `/${item}`;
+          foundUrl = `${space.directApiUrl}${cleanPath}`;
+          break;
+        }
+      } else if (typeof item === 'object') {
+        if (item.url && typeof item.url === 'string') {
+          foundUrl = item.url;
+          if (item.mime_type) mimeType = item.mime_type;
+          break;
+        }
+        if (item.path && typeof item.path === 'string') {
+          foundUrl = `${space.directApiUrl}/file=${item.path}`;
+          if (item.mime_type) mimeType = item.mime_type;
+          break;
+        }
+        if (item.name && typeof item.name === 'string') {
+          foundUrl = `${space.directApiUrl}/file=${item.name}`;
+          break;
+        }
+      }
+    }
+
+    if (!foundUrl) {
+      throw new Error('No media output URL or file path detected in Gradio server response.');
+    }
+
     return {
-      url: dataUrl,
-      mimeType: isVideo ? 'video/mp4' : 'image/png',
+      url: foundUrl,
+      mimeType,
     };
   }
 
@@ -505,91 +793,4 @@ export class BatchQueueEngine {
       console.warn('Direct download blocked by browser policy:', e);
     }
   }
-}
-
-/**
- * Creates a deterministic, aesthetically pleasing SVG/PNG visual asset
- * based on prompt keywords and seed.
- */
-function renderProceduralMedia(prompt: string, seed: number, isVideo: boolean): string {
-  const p = prompt.toLowerCase();
-  
-  // Color palette derived from seed
-  const hue1 = (seed * 37) % 360;
-  const hue2 = (hue1 + 140) % 360;
-  const bg1 = `hsl(${hue1}, 65%, 20%)`;
-  const bg2 = `hsl(${hue2}, 75%, 12%)`;
-  const accent = `hsl(${(hue1 + 70) % 360}, 85%, 60%)`;
-
-  const isPortrait = p.includes('portrait') || p.includes('woman') || p.includes('man') || p.includes('explorer');
-  const isLandscape = p.includes('landscape') || p.includes('mountain') || p.includes('panorama') || p.includes('city') || p.includes('forest');
-  const isCyber = p.includes('cyber') || p.includes('neon') || p.includes('robot') || p.includes('futuristic');
-
-  const cleanPrompt = prompt.replace(/[<>&"]/g, '').slice(0, 80);
-
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-    <defs>
-      <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stop-color="${bg1}" />
-        <stop offset="100%" stop-color="${bg2}" />
-      </linearGradient>
-      <radialGradient id="glow" cx="50%" cy="40%" r="50%">
-        <stop offset="0%" stop-color="${accent}" stop-opacity="0.8" />
-        <stop offset="100%" stop-color="${accent}" stop-opacity="0" />
-      </radialGradient>
-      <pattern id="grid" width="64" height="64" patternUnits="userSpaceOnUse">
-        <path d="M 64 0 L 0 0 0 64" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="1"/>
-      </pattern>
-    </defs>
-    
-    <!-- Background Canvas -->
-    <rect width="1024" height="1024" fill="url(#g1)" />
-    <rect width="1024" height="1024" fill="url(#grid)" />
-    <circle cx="512" cy="460" r="320" fill="url(#glow)" />
-    
-    <!-- Visual Subject Composition -->
-    ${
-      isPortrait
-        ? `
-        <!-- Stylized Head/Portrait -->
-        <circle cx="512" cy="420" r="140" fill="rgba(255,255,255,0.15)" stroke="${accent}" stroke-width="3" />
-        <circle cx="465" cy="400" r="14" fill="${accent}" />
-        <circle cx="559" cy="400" r="14" fill="${accent}" />
-        <path d="M 460 480 Q 512 520 564 480" stroke="${accent}" stroke-width="4" fill="none" stroke-linecap="round" />
-        <path d="M 330 680 Q 512 560 694 680 L 694 860 L 330 860 Z" fill="rgba(255,255,255,0.12)" stroke="${accent}" stroke-width="2" />
-        `
-        : isLandscape
-        ? `
-        <!-- Stylized Mountain & Sun Horizon -->
-        <circle cx="512" cy="420" r="100" fill="${accent}" opacity="0.9" />
-        <polygon points="120,780 440,380 760,780" fill="rgba(20,20,35,0.85)" stroke="${accent}" stroke-width="2" />
-        <polygon points="460,780 720,440 980,780" fill="rgba(10,15,25,0.95)" stroke="rgba(255,255,255,0.2)" stroke-width="2" />
-        <rect x="0" y="760" width="1024" height="264" fill="rgba(0,0,0,0.6)" />
-        <line x1="0" y1="760" x2="1024" y2="760" stroke="${accent}" stroke-width="3" />
-        `
-        : isCyber
-        ? `
-        <!-- Stylized Cyber Core / Geometry -->
-        <polygon points="512,240 680,340 680,540 512,640 344,540 344,340" fill="none" stroke="${accent}" stroke-width="4" />
-        <polygon points="512,300 620,370 620,510 512,580 404,510 404,370" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.4)" stroke-width="2" />
-        <circle cx="512" cy="440" r="45" fill="${accent}" />
-        `
-        : `
-        <!-- Stylized Flowing Form -->
-        <circle cx="512" cy="450" r="180" fill="none" stroke="${accent}" stroke-width="6" />
-        <ellipse cx="512" cy="450" rx="260" ry="100" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="3" transform="rotate(-25 512 450)" />
-        <ellipse cx="512" cy="450" rx="260" ry="100" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="2" transform="rotate(35 512 450)" />
-        `
-    }
-    
-    ${isVideo ? `<g transform="translate(472, 410)"><circle cx="40" cy="40" r="36" fill="rgba(0,0,0,0.6)" stroke="white" stroke-width="2"/><polygon points="32,24 58,40 32,56" fill="white"/></g>` : ''}
-
-    <!-- Bottom Metadata Panel -->
-    <rect x="32" y="880" width="960" height="112" rx="16" fill="rgba(0, 0, 0, 0.75)" stroke="rgba(255, 255, 255, 0.15)" stroke-width="1" />
-    <text x="56" y="922" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="22" font-weight="600">${cleanPrompt}</text>
-    <text x="56" y="962" fill="rgba(255, 255, 255, 0.7)" font-family="monospace" font-size="16">SEED: ${seed} · HF GRADIO PIPELINE · VERIFIED</text>
-    <text x="960" y="962" text-anchor="end" fill="${accent}" font-family="monospace" font-size="16" font-weight="bold">${isVideo ? 'VIDEO [16 FRAMES]' : 'IMAGE [1024x1024]'}</text>
-  </svg>`;
-
-  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }

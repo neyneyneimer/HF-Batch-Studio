@@ -2,9 +2,12 @@ import { Space, SpaceEndpoint, GradioParamSpec, MediaType, ApiProtocol } from '.
 
 export interface SpaceDiscoveryResult {
   success: boolean;
+  verified?: boolean;
   space?: Partial<Space>;
   error?: string;
-  isFallback?: boolean;
+  repoId?: string;
+  directHost?: string;
+  hfUrl?: string;
 }
 
 /**
@@ -16,7 +19,6 @@ export function normalizeSpaceUrl(input: string): {
   hfUrl: string;
 } {
   let clean = input.trim();
-  // Strip trailing slashes
   clean = clean.replace(/\/+$/, '');
 
   let repoId = '';
@@ -25,19 +27,14 @@ export function normalizeSpaceUrl(input: string): {
     const parts = clean.split('huggingface.co/spaces/')[1];
     repoId = parts.split('/')[0] + '/' + parts.split('/')[1];
   } else if (clean.includes('.hf.space')) {
-    // E.g. https://black-forest-labs-flux-1-schnell.hf.space
     const domain = clean.replace(/https?:\/\//, '').split('.hf.space')[0];
-    // Guess repoId if possible
     repoId = domain;
   } else if (clean.includes('/')) {
-    // Already user/space
     repoId = clean;
   } else {
     repoId = clean;
   }
 
-  // Hugging Face direct space subdomain format:
-  // e.g. "black-forest-labs/FLUX.1-schnell" -> "black-forest-labs-flux-1-schnell.hf.space"
   const subdomain = repoId
     .toLowerCase()
     .replace(/\//g, '-')
@@ -50,7 +47,7 @@ export function normalizeSpaceUrl(input: string): {
 }
 
 /**
- * Built-in known public spaces with verified configurations
+ * Verified built-in public Gradio spaces with verified configurations
  */
 export const BUILTIN_SPACES: Space[] = [
   {
@@ -168,8 +165,9 @@ export const BUILTIN_SPACES: Space[] = [
 
 /**
  * Discovers endpoints and parameter configuration from a Gradio Space URL.
- * First queries `/info` (Gradio 4+), then `/config` (Gradio 3), and falls back to
- * built-in templates or custom manual configuration.
+ * Queries the server-side discovery proxy (`/api/gradio/discover`) to bypass CORS,
+ * falling back to direct `/info` query.
+ * REQUIREMENT 2: NEVER silently treats guessed endpoints as verified!
  */
 export async function discoverSpace(
   urlInput: string,
@@ -184,6 +182,7 @@ export async function discoverSpace(
   if (existing) {
     return {
       success: true,
+      verified: true,
       space: {
         ...existing,
         id: `space_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -193,39 +192,75 @@ export async function discoverSpace(
     };
   }
 
-  const headers: Record<string, string> = {};
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+  // Attempt 1: Server-side discovery proxy
+  try {
+    const proxyRes = await fetch('/api/gradio/discover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spaceUrl: urlInput, authToken }),
+    });
+
+    if (proxyRes.ok) {
+      const data = await proxyRes.json();
+      if (data.success && data.space) {
+        return {
+          success: true,
+          verified: true,
+          space: data.space,
+        };
+      } else {
+        // Explicit discovery failure; do NOT guess
+        return {
+          success: false,
+          verified: false,
+          error: data.error || `Gradio schema discovery failed for ${directHost}`,
+          repoId,
+          directHost,
+          hfUrl,
+        };
+      }
+    }
+  } catch {
+    // If running in client-only mode without proxy, try direct fetch
   }
 
-  // Attempt 1: Gradio 4+ OpenAPI schema discovery at `/info`
+  // Attempt 2: Direct client fetch to `/info`
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
+    const headers: Record<string, string> = {};
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
     const infoRes = await fetch(`${directHost}/info`, {
       method: 'GET',
       headers,
       signal: controller.signal,
     });
-    clearTimeout(timeout);
+    clearTimeout(t);
 
     if (infoRes.ok) {
       const info = await infoRes.json();
       const endpoints: SpaceEndpoint[] = [];
-
-      // Parse endpoints from Gradio /info
       const namedEndpoints = info.named_endpoints || {};
+
       for (const [pathKey, spec] of Object.entries<any>(namedEndpoints)) {
         const path = pathKey.startsWith('/') ? pathKey : `/${pathKey}`;
         const params: GradioParamSpec[] = [];
 
         if (Array.isArray(spec.parameters)) {
           spec.parameters.forEach((param: any, idx: number) => {
-            const paramType = mapGradioComponentToType(param.component, param.type);
+            const component = (param.component || '').toLowerCase();
+            const rawType = (param.type || '').toLowerCase();
+            let type: GradioParamSpec['type'] = 'string';
+            if (component === 'slider' || component === 'number' || rawType === 'number') type = 'number';
+            else if (component === 'checkbox' || rawType === 'boolean') type = 'boolean';
+            else if (component === 'dropdown' || component === 'radio') type = 'choice';
+            else if (component === 'image' || rawType.includes('image')) type = 'image';
+            else if (component === 'video' || rawType.includes('video')) type = 'video';
+
             params.push({
               name: param.parameter_name || param.label || `param_${idx}`,
-              type: paramType,
+              type,
               default: param.parameter_default !== undefined ? param.parameter_default : null,
               description: param.description || param.label || '',
               inputIndex: idx,
@@ -233,7 +268,6 @@ export async function discoverSpace(
           });
         }
 
-        // Determine output type
         let outputType: MediaType = 'image';
         if (spec.returns && Array.isArray(spec.returns)) {
           const hasVideo = spec.returns.some(
@@ -244,93 +278,42 @@ export async function discoverSpace(
           if (hasVideo) outputType = 'video';
         }
 
-        endpoints.push({
-          path,
-          isQueue: true,
-          parameters: params,
-          outputType,
-        });
+        endpoints.push({ path, isQueue: true, parameters: params, outputType });
       }
 
       if (endpoints.length > 0) {
-        const primaryEndpoint = endpoints[0];
         return {
           success: true,
+          verified: true,
           space: {
             id: `space_${Date.now()}`,
-            name: repoId || 'Discovered Gradio Space',
+            name: repoId,
             url: hfUrl,
             directApiUrl: directHost,
-            type: primaryEndpoint.outputType,
+            type: endpoints[0].outputType,
             status: 'DISCOVERED',
             apiProtocol: 'v4_stream',
             endpoints,
-            selectedEndpoint: primaryEndpoint.path,
-            description: `Auto-discovered Gradio 4/5 API with ${endpoints.length} endpoint(s).`,
+            selectedEndpoint: endpoints[0].path,
+            description: `Verified Gradio 4/5 API (${endpoints.length} endpoint${endpoints.length > 1 ? 's' : ''})`,
             lastDiscoveredAt: Date.now(),
           },
         };
       }
     }
-  } catch (err) {
-    // Network error or CORS blocked direct query from browser sandbox
+  } catch (err: any) {
+    // Both failed
   }
 
-  // Attempt 2: Fallback manual template inference based on Space name & keywords
-  const isVideo =
-    repoId.toLowerCase().includes('video') ||
-    repoId.toLowerCase().includes('animate') ||
-    repoId.toLowerCase().includes('motion');
-
-  const defaultEndpoints: SpaceEndpoint[] = [
-    {
-      path: '/predict',
-      isQueue: true,
-      outputType: isVideo ? 'video' : 'image',
-      parameters: isVideo
-        ? [
-            { name: 'prompt', type: 'string', default: 'Cinematic fluid motion, high fidelity', inputIndex: 0, description: 'Prompt' },
-            { name: 'seed', type: 'number', default: 42, inputIndex: 1, description: 'Seed' },
-          ]
-        : [
-            { name: 'prompt', type: 'string', default: 'A high quality photograph', inputIndex: 0, description: 'Prompt' },
-            { name: 'negative_prompt', type: 'string', default: 'blurry, bad quality', inputIndex: 1, description: 'Negative' },
-            { name: 'seed', type: 'number', default: 0, inputIndex: 2, description: 'Seed' },
-            { name: 'width', type: 'number', default: 1024, inputIndex: 3, description: 'Width' },
-            { name: 'height', type: 'number', default: 1024, inputIndex: 4, description: 'Height' },
-          ],
-    },
-  ];
-
+  // REQUIREMENT 2: DO NOT GUESS. Return false with details so user can use Manual Mapping!
   return {
-    success: true,
-    isFallback: true,
-    space: {
-      id: `space_${Date.now()}`,
-      name: repoId || 'Gradio Space',
-      url: hfUrl,
-      directApiUrl: directHost,
-      type: isVideo ? 'video' : 'image',
-      status: 'MANUAL',
-      apiProtocol: 'v4_stream',
-      endpoints: defaultEndpoints,
-      selectedEndpoint: '/predict',
-      description: 'Configured via Gradio template. You can customize endpoints and parameter mapping in Space settings.',
-      lastDiscoveredAt: Date.now(),
-    },
+    success: false,
+    verified: false,
+    error: `Could not auto-discover endpoints for "${directHost}". The Space may be paused, private, or not exposing a standard /info schema. Please use Manual Endpoint Mapping to configure its parameters.`,
+    repoId,
+    directHost,
+    hfUrl,
   };
-}
-
-function mapGradioComponentToType(component?: string, rawType?: string): GradioParamSpec['type'] {
-  const c = (component || '').toLowerCase();
-  const t = (rawType || '').toLowerCase();
-
-  if (c === 'slider' || c === 'number' || t === 'number' || t === 'integer') return 'number';
-  if (c === 'checkbox' || t === 'boolean') return 'boolean';
-  if (c === 'dropdown' || c === 'radio') return 'choice';
-  if (c === 'image' || t.includes('image')) return 'image';
-  if (c === 'video' || t.includes('video')) return 'video';
-  return 'string';
 }
 
 /**
@@ -353,7 +336,6 @@ export function buildGradioPayload(
     customParams?: Record<string, any>;
   }
 ): any[] {
-  // Sort parameters by inputIndex
   const sorted = [...paramsSpec].sort((a, b) => a.inputIndex - b.inputIndex);
   const payload: any[] = [];
 
@@ -396,7 +378,7 @@ export function buildGradioPayload(
 
 /**
  * Parses error messages from Gradio / HF responses into standard error categories.
- * Rigorously differentiates quota exhaustion vs auth failure vs timeout vs server crash.
+ * Accurately differentiates quota exhaustion, auth failure, timeout, server errors.
  */
 export function classifyGradioError(
   status: number,
