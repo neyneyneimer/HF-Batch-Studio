@@ -1,0 +1,6 @@
+{
+  "name": "HF Batch Studio",
+  "description": "Personal batch client for public Hugging Face Gradio Spaces supporting image and video generation with endpoint discovery, reusable profiles, seed variation, local preflight, encrypted credentials, and persistent 3-stage queue workers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
